@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap;
 
+#[derive(Clone)]
 pub struct Reward {
     reward: FxHashMap<usize, &'static str>,
 }

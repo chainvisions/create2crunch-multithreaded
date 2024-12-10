@@ -13,6 +13,8 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Height};
 use tiny_keccak::{Hasher, Keccak};
@@ -38,6 +40,7 @@ static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
 /// of three optional values may be provided: a device to target for OpenCL GPU
 /// search, a threshold for leading zeroes to search for, and a threshold for
 /// total zeroes to search for.
+#[derive(Clone)]
 pub struct Config {
     pub factory_address: [u8; 20],
     pub calling_address: [u8; 20],
@@ -45,6 +48,7 @@ pub struct Config {
     pub gpu_device: u8,
     pub leading_zeroes_threshold: u8,
     pub total_zeroes_threshold: u8,
+    pub cpu_threads: u8,
 }
 
 /// Validate the provided arguments and construct the Config struct.
@@ -63,6 +67,10 @@ impl Config {
             return Err("didn't get an init_code_hash argument");
         };
 
+        let cpu_threads_string = match args.next() {
+            Some(arg) => arg,
+            None => String::from("1"),
+        };
         let gpu_device_string = match args.next() {
             Some(arg) => arg,
             None => String::from("255"), // indicates that CPU will be used.
@@ -116,6 +124,11 @@ impl Config {
             return Err("invalid value for total zeroes threshold argument. (valid: 0..=20 | 255)");
         }
 
+        // Convert CPU args to u8.
+        let Ok(cpu_threads) = cpu_threads_string.parse::<u8>() else {
+            return Err("invalid CPU threads arg supplied");
+        };
+
         Ok(Self {
             factory_address,
             calling_address,
@@ -123,6 +136,7 @@ impl Config {
             gpu_device,
             leading_zeroes_threshold,
             total_zeroes_threshold,
+            cpu_threads,
         })
     }
 }
@@ -148,91 +162,105 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
     // create object for computing rewards (relative rarity) for a given address
     let rewards = Reward::new();
 
+    // Create an mpsc channel.
+    let (tx, rx) = mpsc::channel();
+
     // begin searching for addresses
-    loop {
-        // header: 0xff ++ factory ++ caller ++ salt_random_segment (47 bytes)
-        let mut header = [0; 47];
-        header[0] = CONTROL_CHARACTER;
-        header[1..21].copy_from_slice(&config.factory_address);
-        header[21..41].copy_from_slice(&config.calling_address);
-        header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
+    for i in 0..config.cpu_threads {
+        let sender = tx.clone();
+        let reward = rewards.clone();
+        let cfg = config.clone();
+        // TODO: Do we need this much cloning?
+        thread::spawn(move || {
+            println!("Spawned thread #{i}");
+            loop {
+                // header: 0xff ++ factory ++ caller ++ salt_random_segment (47 bytes)
+                let mut header = [0; 47];
+                header[0] = CONTROL_CHARACTER;
+                header[1..21].copy_from_slice(&cfg.factory_address);
+                header[21..41].copy_from_slice(&cfg.calling_address);
+                header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
 
-        // create new hash object
-        let mut hash_header = Keccak::v256();
+                // create new hash object
+                let mut hash_header = Keccak::v256();
 
-        // update hash with header
-        hash_header.update(&header);
+                // update hash with header
+                hash_header.update(&header);
 
-        // iterate over a 6-byte nonce and compute each address
-        (0..MAX_INCREMENTER)
-            .into_par_iter() // parallelization
-            .for_each(|salt| {
-                let salt = salt.to_le_bytes();
-                let salt_incremented_segment = &salt[..6];
+                // iterate over a 6-byte nonce and compute each address
+                (0..MAX_INCREMENTER)
+                    .into_par_iter() // parallelization
+                    .for_each(|salt| {
+                        let salt = salt.to_le_bytes();
+                        let salt_incremented_segment = &salt[..6];
 
-                // clone the partially-hashed object
-                let mut hash = hash_header.clone();
+                        // clone the partially-hashed object
+                        let mut hash = hash_header.clone();
 
-                // update with body and footer (total: 38 bytes)
-                hash.update(salt_incremented_segment);
-                hash.update(&config.init_code_hash);
+                        // update with body and footer (total: 38 bytes)
+                        hash.update(salt_incremented_segment);
+                        hash.update(&cfg.init_code_hash);
 
-                // hash the payload and get the result
-                let mut res: [u8; 32] = [0; 32];
-                hash.finalize(&mut res);
+                        // hash the payload and get the result
+                        let mut res: [u8; 32] = [0; 32];
+                        hash.finalize(&mut res);
 
-                // get the address that results from the hash
-                let address = <&Address>::try_from(&res[12..]).unwrap();
+                        // get the address that results from the hash
+                        let address = <&Address>::try_from(&res[12..]).unwrap();
 
-                // count total and leading zero bytes
-                let mut total = 0;
-                let mut leading = 21;
-                for (i, &b) in address.iter().enumerate() {
-                    if b == 0 {
-                        total += 1;
-                    } else if leading == 21 {
-                        // set leading on finding non-zero byte
-                        leading = i;
-                    }
-                }
+                        // count total and leading zero bytes
+                        let mut total = 0;
+                        let mut leading = 21;
+                        for (i, &b) in address.iter().enumerate() {
+                            if b == 0 {
+                                total += 1;
+                            } else if leading == 21 {
+                                // set leading on finding non-zero byte
+                                leading = i;
+                            }
+                        }
 
-                // only proceed if there are at least three zero bytes
-                if total < 3 {
-                    return;
-                }
+                        // only proceed if there are at least three zero bytes
+                        if total < 3 {
+                            return;
+                        }
 
-                // look up the reward amount
-                let key = leading * 20 + total;
-                let reward_amount = rewards.get(&key);
+                        // look up the reward amount
+                        let key = leading * 20 + total;
+                        let reward_amount = reward.get(&key);
 
-                // only proceed if an efficient address has been found
-                if reward_amount.is_none() {
-                    return;
-                }
+                        // only proceed if an efficient address has been found
+                        if reward_amount.is_none() {
+                            return;
+                        }
 
-                // get the full salt used to create the address
-                let header_hex_string = hex::encode(header);
-                let body_hex_string = hex::encode(salt_incremented_segment);
-                let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
+                        // get the full salt used to create the address
+                        let header_hex_string = hex::encode(header);
+                        let body_hex_string = hex::encode(salt_incremented_segment);
+                        let full_salt =
+                            format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
 
-                // display the salt and the address.
-                let output = format!(
-                    "{full_salt} => {address} => {}",
-                    reward_amount.unwrap_or("0")
-                );
-                println!("{output}");
+                        // display the salt and the address.
+                        let output = format!(
+                            "{full_salt} => {address} => {}",
+                            reward_amount.unwrap_or("0")
+                        );
+                        println!("{output}");
 
-                // create a lock on the file before writing
-                file.lock_exclusive().expect("Couldn't lock file.");
-
-                // write the result to file
-                writeln!(&file, "{output}")
-                    .expect("Couldn't write to `efficient_addresses.txt` file.");
-
-                // release the file lock
-                file.unlock().expect("Couldn't unlock file.")
-            });
+                        // Send address to the receiver to write.
+                        sender.send(output).unwrap();
+                    });
+            }
+        });
     }
+
+    while let Ok(received) = rx.recv() {
+        file.lock_exclusive().expect("Couldn't lock file.");
+        writeln!(&file, "{received}").expect("Couldn't write to `efficient_addresses.txt file.");
+        file.unlock().expect("Couldn't unlock file.");
+    }
+
+    Ok(())
 }
 
 /// Given a Config object with a factory address, a caller address, a keccak-256
