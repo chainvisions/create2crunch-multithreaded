@@ -254,10 +254,51 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
         });
     }
 
+    let start_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let mut rate: f64 = 0.0;
+    let mut nonce: u64 = 0;
+    let mut previous_time: f64 = 0.0;
+
     while let Ok(received) = rx.recv() {
+        nonce += 1;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let current_time: f64 = now.as_secs() as f64;
+        let print_output = current_time - previous_time > 0.99;
+        previous_time = current_time;
         file.lock_exclusive().expect("Couldn't lock file.");
         writeln!(&file, "{received}").expect("Couldn't write to `efficient_addresses.txt file.");
         file.unlock().expect("Couldn't unlock file.");
+
+        if print_output {
+            let total_runtime = current_time - start_time;
+            let total_runtime_hrs = total_runtime as u64 / 3600;
+            let total_runtime_mins = (total_runtime as u64 - total_runtime_hrs * 3600) / 60;
+            let total_runtime_secs = total_runtime
+                - (total_runtime_hrs * 3600) as f64
+                - (total_runtime_mins * 60) as f64;
+            let work_rate: u128 = WORK_FACTOR * nonce as u128;
+            if total_runtime > 0.0 {
+                rate = 1.0 / total_runtime;
+            }
+            let cycles = if nonce > MAX_INCREMENTER {
+                nonce / MAX_INCREMENTER
+            } else {
+                0
+            };
+            println!("\x1B[2J\x1B[1;1H"); // Clear screen
+            println!(
+                "Total runtime: {}:{:02}:{:02} ({:.0} cycles)\n\
+                 Rate: {:.2} million addresses per second\n",
+                cycles,
+                total_runtime_hrs,
+                total_runtime_mins,
+                total_runtime_secs,
+                work_rate as f64 * rate
+            );
+        }
     }
 
     Ok(())
@@ -401,7 +442,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
             // calculate the current time
             let mut now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            let current_time = now.as_secs() as f64;
+            let current_time: f64 = now.as_secs() as f64;
 
             // we don't want to print too fast
             let print_output = current_time - previous_time > 0.99;
