@@ -14,6 +14,8 @@ use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Height};
@@ -165,105 +167,99 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
     // Create an mpsc channel.
     let (tx, rx) = mpsc::channel();
 
+    let cumulative_nonce = Arc::new(AtomicU64::new(0));
+
     // begin searching for addresses
-    for i in 0..config.cpu_threads {
-        let sender = tx.clone();
-        let reward = rewards.clone();
-        let cfg = config.clone();
-        // TODO: Do we need this much cloning?
-        thread::spawn(move || {
-            println!("Spawned thread #{i}");
-            loop {
-                // header: 0xff ++ factory ++ caller ++ salt_random_segment (47 bytes)
-                let mut header = [0; 47];
-                header[0] = CONTROL_CHARACTER;
-                header[1..21].copy_from_slice(&cfg.factory_address);
-                header[21..41].copy_from_slice(&cfg.calling_address);
-                header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
+    let cnonce = cumulative_nonce.clone();
+    thread::spawn(move || {
+        loop {
+            // header: 0xff ++ factory ++ caller ++ salt_random_segment (47 bytes)
+            let mut header = [0; 47];
+            header[0] = CONTROL_CHARACTER;
+            header[1..21].copy_from_slice(&config.factory_address);
+            header[21..41].copy_from_slice(&config.calling_address);
+            header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
 
-                // create new hash object
-                let mut hash_header = Keccak::v256();
+            // create new hash object
+            let mut hash_header = Keccak::v256();
 
-                // update hash with header
-                hash_header.update(&header);
+            // update hash with header
+            hash_header.update(&header);
 
-                // iterate over a 6-byte nonce and compute each address
-                (0..MAX_INCREMENTER)
-                    .into_par_iter() // parallelization
-                    .for_each(|salt| {
-                        let salt = salt.to_le_bytes();
-                        let salt_incremented_segment = &salt[..6];
+            // iterate over a 6-byte nonce and compute each address
+            (0..MAX_INCREMENTER)
+                .into_par_iter() // parallelization
+                .for_each(|salt| {
+                    let salt = salt.to_le_bytes();
+                    let salt_incremented_segment = &salt[..6];
 
-                        // clone the partially-hashed object
-                        let mut hash = hash_header.clone();
+                    // clone the partially-hashed object
+                    let mut hash = hash_header.clone();
 
-                        // update with body and footer (total: 38 bytes)
-                        hash.update(salt_incremented_segment);
-                        hash.update(&cfg.init_code_hash);
+                    // update with body and footer (total: 38 bytes)
+                    hash.update(salt_incremented_segment);
+                    hash.update(&config.init_code_hash);
 
-                        // hash the payload and get the result
-                        let mut res: [u8; 32] = [0; 32];
-                        hash.finalize(&mut res);
+                    // hash the payload and get the result
+                    let mut res: [u8; 32] = [0; 32];
+                    hash.finalize(&mut res);
 
-                        // get the address that results from the hash
-                        let address = <&Address>::try_from(&res[12..]).unwrap();
+                    // get the address that results from the hash
+                    let address = <&Address>::try_from(&res[12..]).unwrap();
 
-                        // count total and leading zero bytes
-                        let mut total = 0;
-                        let mut leading = 21;
-                        for (i, &b) in address.iter().enumerate() {
-                            if b == 0 {
-                                total += 1;
-                            } else if leading == 21 {
-                                // set leading on finding non-zero byte
-                                leading = i;
-                            }
+                    // count total and leading zero bytes
+                    let mut total = 0;
+                    let mut leading = 21;
+                    for (i, &b) in address.iter().enumerate() {
+                        if b == 0 {
+                            total += 1;
+                        } else if leading == 21 {
+                            // set leading on finding non-zero byte
+                            leading = i;
                         }
+                    }
 
-                        // only proceed if there are at least three zero bytes
-                        if total < 3 {
-                            return;
-                        }
+                    // only proceed if there are at least three zero bytes
+                    if total < 3 {
+                        return;
+                    }
 
-                        // look up the reward amount
-                        let key = leading * 20 + total;
-                        let reward_amount = reward.get(&key);
+                    // look up the reward amount
+                    let key = leading * 20 + total;
+                    let reward_amount = rewards.get(&key);
 
-                        // only proceed if an efficient address has been found
-                        if reward_amount.is_none() {
-                            return;
-                        }
+                    // only proceed if an efficient address has been found
+                    if reward_amount.is_none() {
+                        return;
+                    }
 
-                        // get the full salt used to create the address
-                        let header_hex_string = hex::encode(header);
-                        let body_hex_string = hex::encode(salt_incremented_segment);
-                        let full_salt =
-                            format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
+                    // get the full salt used to create the address
+                    let header_hex_string = hex::encode(header);
+                    let body_hex_string = hex::encode(salt_incremented_segment);
+                    let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
 
-                        // display the salt and the address.
-                        let output = format!(
-                            "{full_salt} => {address} => {}",
-                            reward_amount.unwrap_or("0")
-                        );
-                        println!("{output}");
+                    // display the salt and the address.
+                    let output = format!(
+                        "{full_salt} => {address} => {}",
+                        reward_amount.unwrap_or("0")
+                    );
+                    println!("{output}");
 
-                        // Send address to the receiver to write.
-                        sender.send(output).unwrap();
-                    });
-            }
-        });
-    }
+                    // Send address to the receiver to write.
+                    cnonce.fetch_add(1, Ordering::Relaxed);
+                    tx.send(output).unwrap();
+                });
+        }
+    });
 
     let start_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs_f64();
     let mut rate: f64 = 0.0;
-    let mut nonce: u64 = 0;
     let mut previous_time: f64 = 0.0;
 
     while let Ok(received) = rx.recv() {
-        nonce += 1;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let current_time: f64 = now.as_secs() as f64;
         let print_output = current_time - previous_time > 0.99;
@@ -279,12 +275,13 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
             let total_runtime_secs = total_runtime
                 - (total_runtime_hrs * 3600) as f64
                 - (total_runtime_mins * 60) as f64;
-            let work_rate: u128 = WORK_FACTOR * nonce as u128;
+            let cnonce = cumulative_nonce.load(Ordering::Relaxed).clone();
+            let work_rate: u128 = WORK_FACTOR * cnonce as u128;
             if total_runtime > 0.0 {
                 rate = 1.0 / total_runtime;
             }
-            let cycles = if nonce > MAX_INCREMENTER {
-                nonce / MAX_INCREMENTER
+            let cycles = if cnonce > MAX_INCREMENTER {
+                cnonce / MAX_INCREMENTER
             } else {
                 0
             };
